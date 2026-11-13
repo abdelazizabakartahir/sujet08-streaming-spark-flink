@@ -1,14 +1,20 @@
-﻿version: '3.8'
-
-services:
+﻿services:
+  # ==============================================================================
+  # KAFKA (Mode KRaft - sans Zookeeper)
+  # ==============================================================================
+  # Broker de messages qui reçoit les transactions du producteur.
+  # Configuration en mode KRaft (Kafka 3.x+) pour éviter Zookeeper.
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
+    init: true
     ports:
       - "9092:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: 'broker,controller'
+      # Les listeners définissent comment Kafka écoute les connexions internes (Docker)
+      # et externes (localhost).
       KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
       KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
       KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
@@ -18,13 +24,23 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Timeouts ajustés pour un environnement Docker (évite les faux positifs "unhealthy")
+      KAFKA_BROKER_HEARTBEAT_INTERVAL_MS: 4000
+      KAFKA_BROKER_SESSION_TIMEOUT_MS: 10000 
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
-    healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
+    # Commande de démarrage : formate le stockage si nécessaire, puis lance Kafka.
+    command: >
+      bash -c "
+      if [ ! -f /var/lib/kafka/data/meta.properties ]; then
+        kafka-storage format --ignore-formatted --cluster-id='MkU3OEVBNTcwNTJENDM2Qk' --config /etc/kafka/kafka.properties;
+      fi;
+      /etc/confluent/docker/run
+      "
 
+  # ==============================================================================
+  # KAFKA UI (Interface de visualisation)
+  # ==============================================================================
+  # Permet de voir les topics, les messages et les consommateurs.
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -34,35 +50,54 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
     depends_on:
-      kafka:
-        condition: service_healthy
+      - kafka
 
+  # ==============================================================================
+  # SPARK MASTER (Nœud maître du cluster)
+  # ==============================================================================
+  # Gère la distribution des tâches aux workers.
   spark-master:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.1-python3
     container_name: spark-master
-    environment:
-      - SPARK_MODE=master
-      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.master.Master
+      --host spark-master
+      --port 7077
+      --webui-port 8080
     ports:
-      - "8081:8080"
-      - "7077:7077"
+      - "8081:8080"  # UI Spark
+      - "7077:7077"  # Communication Master/Worker
     volumes:
       - ./spark-job:/opt/spark-jobs
       - ./checkpoints/spark:/tmp/checkpoints
 
+  # ==============================================================================
+  # SPARK WORKER (Nœud de calcul)
+  # ==============================================================================
+  # Exécute les tâches envoyées par le master.
+  # Limite de mémoire fixée à 3 Go pour éviter les crashs OOM.
   spark-worker:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.1-python3
     container_name: spark-worker
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-      - SPARK_WORKER_MEMORY=2G
-      - SPARK_WORKER_CORES=2
+    mem_limit: 3g
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077
+      --webui-port 8081
+      --memory 2G
+      --cores 2
     depends_on:
       - spark-master
     volumes:
       - ./spark-job:/opt/spark-jobs
 
+  # ==============================================================================
+  # SPARK JOB (Notre application de streaming)
+  # ==============================================================================
+  # Soumet le script spark_streaming.py au cluster Spark.
+  # Les JARs Kafka sont fournis localement pour éviter le téléchargement à chaque démarrage.
   spark-job:
     build: ./spark-job
     container_name: spark-job
@@ -75,31 +110,44 @@ services:
       - ./spark-job:/opt/spark-jobs
       - ./checkpoints/spark:/tmp/checkpoints/spark
     command: >
-      /opt/bitnami/spark/bin/spark-submit
+      /opt/spark/bin/spark-submit
       --master spark://spark-master:7077
-      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0
+      --executor-memory 512m
+      --executor-cores 1
+      --conf spark.driver.host=spark-job
+      --jars /opt/spark-jobs/spark-sql-kafka-0-10_2.12-3.5.1.jar,/opt/spark-jobs/spark-token-provider-kafka-0-10_2.12-3.5.1.jar,/opt/spark-jobs/kafka-clients-3.4.1.jar,/opt/spark-jobs/lz4-java-1.8.0.jar,/opt/spark-jobs/snappy-java-1.1.10.3.jar,/opt/spark-jobs/commons-pool2-2.11.1.jar
       /opt/spark-jobs/spark_streaming.py
     depends_on:
       - spark-master
       - kafka
 
+  # ==============================================================================
+  # FLINK JOBMANAGER (Nœud maître)
+  # ==============================================================================
+  # Coordonne les tâches et gère les checkpoints.
   flink-jobmanager:
     image: flink:1.18-scala_2.12
     container_name: flink-jobmanager
     command: jobmanager
     ports:
-      - "8082:8081"
+      - "8082:8081"  # UI Flink
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
+        rest.address: flink-jobmanager
         state.backend: rocksdb
         state.checkpoints.dir: file:///tmp/flink-checkpoints
         execution.checkpointing.interval: 5000
     volumes:
       - ./flink-job:/opt/flink/usrlib
       - ./checkpoints/flink:/tmp/flink-checkpoints
+      - ./flink-job/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar
 
+  # ==============================================================================
+  # FLINK TASKMANAGER (Nœud de calcul)
+  # ==============================================================================
+  # Exécute les tâches de traitement.
   flink-taskmanager:
     image: flink:1.18-scala_2.12
     container_name: flink-taskmanager
@@ -116,7 +164,12 @@ services:
     volumes:
       - ./flink-job:/opt/flink/usrlib
       - ./checkpoints/flink:/tmp/flink-checkpoints
+      - ./flink-job/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar
 
+  # ==============================================================================
+  # FLINK JOB (Notre application de streaming)
+  # ==============================================================================
+  # Soumet le script flink_job.py au cluster Flink.
   flink-job:
     build: ./flink-job
     container_name: flink-job
@@ -124,17 +177,22 @@ services:
       KAFKA_BROKER: kafka:29092
       INPUT_TOPIC: sales
       OUTPUT_TOPIC: sales-aggregated-flink
+      FLINK_JOBMANAGER_HOST: flink-jobmanager
     volumes:
       - ./flink-job:/opt/flink/usrlib
       - ./checkpoints/flink:/tmp/flink-checkpoints
       - ./flink-job/flink-sql-connector-kafka-3.1.0-1.18.jar:/opt/flink/lib/flink-sql-connector-kafka-3.1.0-1.18.jar
     command: >
-      flink run -d -py /opt/flink/usrlib/flink_job.py
+      flink run -d -m flink-jobmanager:8081 -py /opt/flink/usrlib/flink_job.py
     depends_on:
       - flink-jobmanager
       - flink-taskmanager
       - kafka
 
+  # ==============================================================================
+  # PRODUCER (Simulateur de transactions)
+  # ==============================================================================
+  # Envoie des messages JSON dans le topic "sales".
   producer:
     build: ./producer
     container_name: producer
@@ -144,5 +202,4 @@ services:
       RATE: 100
       LATE_RATIO: 0.05
     depends_on:
-      kafka:
-        condition: service_healthy
+      - kafka

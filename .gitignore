@@ -1,9 +1,34 @@
-﻿__pycache__/
+﻿# Python
+__pycache__/
 *.pyc
+*.pyo
 .venv/
+env/
+
+# Environnement et secrets
 .env
+
+# Spark et Flink
 checkpoints/
+spark-warehouse/
 .flink/
 *.log
+
+# Système
 .DS_Store
-spark-warehouse/
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Fichiers temporaires
+*.tmp
+~$*.docx
+~$*.pptx
+
+# Données volumineuses (optionnel)
+*.csv
+*.parquet
+*.avro
+~$*
